@@ -1,0 +1,18 @@
+# The base image's `ONBUILD COPY . .` copies this whole context, so anything not ignored here ends up in every consumer image.
+# node_modules/ in particular: it would overwrite the modules the base's ONBUILD `npm install` just installed.
+node_modules/
+npm-debug.log*
+
+# Env files never belong in an image.
+.env
+.env.*
+
+# VCS, IDE and OS files.
+.git/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Not needed in the context (BuildKit still reads the Dockerfile itself).
+Dockerfile

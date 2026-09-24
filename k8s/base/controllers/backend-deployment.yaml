@@ -1,0 +1,192 @@
+# Usual use-cases (Deployment): stateless, always-on services whose Pods are interchangeable;
+# web frontends, REST APIs, queue consumers. Scale by changing the replica count.
+#
+# Two scheduling types: time-schedule (cronjob) vs node-placement scheduling (deployment)
+#   Node-placement scheduling: which node it runs on, decided using resource requests, affinity/podAntiAffinity, topologySpreadConstraints, tolerations. Nothing to do with time.
+#   Time-schedule: when a Job gets created, decided by the CronJob controller watching the clock. Nothing to do with nodes.
+#
+# Purpose: Defines the backend pods (scheduler template) and its containers and how they run.
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   backend-deployment -- referenced by ../policy/horizontal-pod-autoscaler.yaml (scaleTargetRef.name)
+#   app.kubernetes.io/name: backend (pod label) -- referenced by ../networking/backend-service.yaml (selector)
+#   app.kubernetes.io/name: backend (pod label) -- referenced by ../policy/pod-disruption-budget.yaml (selector)
+#   app.kubernetes.io/name: backend (pod label) -- referenced by ../networking/networkpolicy.yaml (podSelector + ingress from)
+#   be-deploy-port -- referenced by ../networking/backend-service.yaml (targetPort)
+# REFERENCES:
+#   backend-sa -- defined in ../config/serviceaccount.yaml
+#   backend-config -- defined in ../config/configmap.yaml
+#   backend-secret -- defined in ../config/secret.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-deployment
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "items-api (Spring Boot): 2 self-healing replicas, rolling updates without downtime"
+spec:
+  # running fixed number of pod's replicas (2), all at time,
+  # restarts crashed ones, rolls them out without downtime (auto-healing).
+  replicas: 2
+  revisionHistoryLimit: 3
+  minReadySeconds: 5            # a new Pod must stay Ready this long before it counts as available
+  progressDeadlineSeconds: 600  # a rollout that makes no progress for 10 minutes is reported as failed
+  paused: false
+  #   kubectl rollout status deployment/backend-deployment -n docker-kubernetes-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  # ===== POD ===== everything from `template:` down to the end of this file IS the Pod --
+  # the Deployment above it only says "keep 2 copies of this Pod running."
+  # Nothing above this line describes a running thing.
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backend
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: docker-kubernetes-app
+    spec:
+      serviceAccountName: backend-sa
+      terminationGracePeriodSeconds: 30
+      restartPolicy: Always   # the only value a Deployment allows
+      dnsPolicy: ClusterFirst
+      hostNetwork: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      # Common fields missing: imagePullSecrets, priorityClassName
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      # ---- INITIAL CONTAINER ---- runs to completion before any container in `containers` below starts.
+      # Don't start the app until its database dependency is actually reachable.
+      initContainers:
+        - name: wait-for-database
+          # The smallest Unix tools image (~2 MB, smaller than Alpine), bundling sh, nc, sleep, echo, etc.
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - until nc -z database 5432; do echo waiting for database; sleep 2; done
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      # ---- CONTAINERS ---- the container(s) that actually keep running for the Pod's lifetime.
+      # This Pod has only one Container (but can list more than one).
+      containers:
+        - name: backend
+          image: docker-kubernetes-app/backend:latest
+          # Always forces every pod (re)start to re-check the local :latest tag instead of trusting whatever was cached.
+          # Needed here because this image is only ever built locally and never re-tagged,
+          # so IfNotPresent would silently keep running stale code even after a fresh docker build.
+          imagePullPolicy: Always
+          # Common fields missing: command
+          args:
+            - -XX:MaxRAMPercentage=75.0   # size the JVM heap from the container's memory limit instead of the node's RAM
+            - -jar
+            - app.jar
+          workingDir: /app   # the image's own WORKDIR, stated explicitly
+          ports:
+            - name: be-deploy-port
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: backend-config
+          env:
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: API_TOKEN
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: be-deploy-port
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: be-deploy-port
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: be-deploy-port
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            # Common fields missing: postStart
+            # preStop waits so the Service stops routing here before shutdown begins
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            # Spring Boot's embedded Tomcat creates a work directory under java.io.tmpdir (/tmp) at startup.
+            # with readOnlyRootFilesystem above, /tmp is read-only too, unless something is mounted over it,
+            # so without this the container crash-loops on its very first request to write there.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      # Best-effort spread across nodes -- "preferred", not "required",
+      # so scheduling still succeeds even though affinity rules can't be satisfied.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: backend
+                topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: backend
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"

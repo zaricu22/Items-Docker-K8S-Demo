@@ -1,0 +1,39 @@
+# Purpose: dev-specific tweaks on top of the shared base.
+# Nothing here edits k8s/base/ itself; it's all layered on top.
+#
+#   kubectl kustomize k8s/overlays/dev/     # render + validate locally, no cluster needed
+#   kubectl apply -k k8s/overlays/dev/      # actually apply this environment's version
+#
+# What an overlay can and can't do to the base, compared to a Compose override file
+# (docker/docker-compose.dev.yml):
+#   - EDIT an existing object's fields    -- yes, a patch matches by apiVersion+kind+metadata.name
+#     and only sets the fields it lists; see backend-replicas.yaml (Deployment.spec.replicas) and
+#     log-level.yaml (ConfigMap.data.LOG_LEVEL, already "info" in the base) below
+#   - ADD a new field to an existing object -- not demonstrated here: every patch below only
+#     overrides a key the base object already has (Compose's LOG_LEVEL-style "new key merged into
+#     an existing map" has no example on this side)
+#   - ADD a brand-new object              -- yes, see frontend-localhost.yaml, listed under
+#     `resources:` below alongside ../../base, not under `patches:`
+#   - REMOVE an object the base defines   -- not used in this overlay, but Kustomize does support
+#     it natively (a patch file with just `$patch: delete` plus the same apiVersion/kind/
+#     metadata.name) -- unlike a Compose override file, which has no equivalent
+
+# The one line that ties this overlay to the shared base
+resources:
+  - ../../base
+  - frontend-localhost.yaml
+
+# Each patch below overrides only the fields it sets, matched by apiVersion+kind+metadata.name
+# against the object already in the base -- everything is left untouched.
+patches:
+  - path: backend-replicas.yaml
+  - path: frontend-replicas.yaml
+  - path: log-level.yaml
+
+# Rewrites the tag on any image whose repository matches, wherever it appears in the base,
+# so backend-deployment.yaml's docker-kubernetes-app/backend:latest becomes :dev here, without touching the base file itself.
+images:
+  - name: docker-kubernetes-app/backend
+    newTag: dev
+  - name: docker-kubernetes-app/frontend
+    newTag: dev

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- spring-boot-starter-parent pins dependency versions (Jackson, Tomcat,
+       Spring Framework itself, ...) so the one Spring Boot version below is
+       the only version number this whole app has to track. -->
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.4</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.example</groupId>
+  <artifactId>items-api</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <java.version>21</java.version>
+  </properties>
+
+  <dependencies>
+    <!-- Embedded Tomcat + Spring MVC: everything @RestController needs. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Repackages the plain jar `mvn package` produces into an
+           executable "fat" jar (app classes + all dependencies + an
+           embedded Tomcat): this is the *.jar the Dockerfile's
+           multi-stage COPY pulls out of this build stage, and that
+           ENTRYPOINT ["java"] actually runs. Bound to the `package`
+           phase automatically by virtue of declaring it here with
+           spring-boot-starter-parent as the parent: no explicit
+           <executions> needed. -->
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

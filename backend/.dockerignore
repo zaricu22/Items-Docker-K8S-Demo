@@ -1,0 +1,19 @@
+# Build output: the image compiles its own inside the build stage.
+target/
+*.class
+*.log
+
+# Env files are read by Compose on the host (env_file), never needed inside the image.
+.env
+.env.*
+
+# VCS, IDE and OS files.
+.git/
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Not needed in the context (BuildKit still reads the Dockerfile itself).
+Dockerfile

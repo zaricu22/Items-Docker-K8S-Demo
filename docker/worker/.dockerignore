@@ -1,0 +1,22 @@
+# Passed with `--secret id=build_token,src=...`, never through the build context.
+build_token.txt
+
+# Env files never belong in an image.
+.env
+.env.*
+
+# Local build output: the image compiles its own binary.
+bin/
+*.exe
+*.test
+*.log
+
+# VCS, IDE and OS files.
+.git/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Not needed in the context (BuildKit still reads the Dockerfile itself).
+Dockerfile

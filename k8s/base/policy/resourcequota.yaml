@@ -1,0 +1,45 @@
+# Purpose: a namespace-wide ceiling on total resource consumption --
+# caps how much CPU/memory every pod in this namespace can request/use combined,
+# and how many pods can exist at once, independent of what any single container's own limits say.
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   namespace-quota -- not referenced by name anywhere (ResourceQuota applies automatically, no selector at all)
+# REFERENCES:
+#   no names
+#
+# LIMITS: limits.cpu must stay above the combined CPU limit of every Pod that can run at the same time.
+#  Otherwise new Pods (including the extra Pod a rolling update adds) are rejected and the rollout stalls.
+#  Worst case today:
+#   backend   6 x 500m = 3000m   (maxReplicas of the HorizontalPodAutoscaler, HPA)
+#   frontend  2 x 200m =  400m   (3 x 200m = 600m in the prod overlay)
+#   database  1 x 500m =  500m
+#   worker    1 x 100m =  100m   (one per node, so it grows with the node count)
+#   total                4000m   (4200m in prod),
+#   against the 5000m ceiling below
+# The 800-1000m left over is the room for rollout surge Pods and the 100m Jobs.
+# Too tight a ceiling has already stalled rollouts twice (an HPA at its maximum, and prod's third frontend replica),
+# so re-check this number whenever any replica count, HPA maximum or container CPU limit changes.
+#   kubectl describe resourcequota namespace-quota -n docker-kubernetes-app   # live Used vs Hard
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: namespace-quota
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Namespace-wide ceiling on compute, storage and object counts"
+spec:
+  # Common fields missing: scopes, scopeSelector
+  hard:
+    requests.cpu: "2"
+    requests.memory: 2Gi
+    limits.cpu: "5"
+    limits.memory: 4Gi
+    pods: "20"
+    persistentvolumeclaims: "4"
+    requests.storage: 10Gi
+    services.loadbalancers: "1"   # only the dev overlay's frontend-dev-localhost is a LoadBalancer Service
+    count/deployments.apps: "6"
+    count/jobs.batch: "10"        # includes finished Jobs kept as CronJob history

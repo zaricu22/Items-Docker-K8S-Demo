@@ -1,0 +1,114 @@
+# Usual use-cases (Job): one-off tasks that run to completion once;
+# database schema migrations, data imports/backfills, batch processing, one-time setup.
+#
+# Purpose: a real one-off schema migration -- waits for Postgres, then creates the `items` table if it is missing.
+# Idempotent (IF NOT EXISTS), so re-running it is harmless.
+#   kubectl delete job db-migration -n docker-kubernetes-app && kubectl apply -f migration-job.yaml   # a finished Job won't restart on its own
+# A Job runs to completion once, then stops -- unlike a Deployment's pods, which are meant to keep running indefinitely.
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   db-migration -- not referenced by name anywhere else (no pod label either -- no Service targets a one-shot Job)
+# REFERENCES:
+#   database -- Service defined in ../networking/database-service.yaml (PGHOST)
+#   database-secret -- defined in ../config/database-secret.yaml (PGPASSWORD)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: database
+    app.kubernetes.io/component: migration
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "One-off schema migration: creates the items table in Postgres (idempotent)"
+spec:
+  completions: 1
+  parallelism: 1
+  completionMode: NonIndexed
+  suspend: false
+  activeDeadlineSeconds: 300   # give up if the migration has not finished after 5 minutes
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  podFailurePolicy:
+    rules:
+      # psql exits with 1 when the SQL itself fails: retrying the same broken statement cannot succeed, so stop right away
+      - action: FailJob
+        onExitCodes:
+          containerName: migrate
+          operator: In
+          values: [1]
+      # a Pod evicted or preempted by the cluster is not the migration's fault, so it does not count against backoffLimit
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget
+  # ===== POD ===== everything from `template:` down to the end of this file IS the Pod;
+  # the Job above it says "run this Pod to completion once (retrying up to backoffLimit times on failure), not indefinitely."
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: database
+        app.kubernetes.io/component: migration
+        app.kubernetes.io/part-of: docker-kubernetes-app
+    spec:
+      restartPolicy: Never   # podFailurePolicy requires Never: a failed Pod is replaced by a new one, up to backoffLimit
+      serviceAccountName: default
+      automountServiceAccountToken: false   # psql never calls the Kubernetes API, so the Pod gets no token
+      dnsPolicy: ClusterFirst
+      hostNetwork: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      # Common fields missing: initContainers, volumes, affinity, imagePullSecrets, priorityClassName
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70   # the `postgres` user baked into the alpine image
+        runAsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+      # ---- CONTAINERS ---- the container(s) that run for this Pod;
+      # once this one exits, the Pod (and the Job it belongs to) is done.
+      containers:
+        - name: migrate
+          # Same image as the database itself, so psql/pg_isready always match the server version.
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          # Common fields missing: args
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready; do echo waiting for database; sleep 2; done
+              psql -c "CREATE TABLE IF NOT EXISTS items (id serial PRIMARY KEY, name text NOT NULL, created_at timestamptz NOT NULL DEFAULT now())"
+          # Common fields missing: envFrom, workingDir, volumeMounts, ports
+          # PG* variables: read by psql and pg_isready for host, user, database and password, so the commands need no flags
+          env:
+            - name: PGHOST
+              value: database
+            - name: PGUSER
+              value: items
+            - name: PGDATABASE
+              value: items
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: database-secret
+                  key: POSTGRES_PASSWORD
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 70   # the `postgres` user baked into the alpine image
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

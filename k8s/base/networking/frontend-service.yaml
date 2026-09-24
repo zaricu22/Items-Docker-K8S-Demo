@@ -1,0 +1,39 @@
+# Purpose: a stable cluster-level DNS name and internally load-balanced entry point for frontend pods,
+# because pods change IP on every restart/reschedule (but service-level defined address doesn't).
+#
+# Ingress:
+#   ingress.yaml targets this Service by name.
+#   If Ingress object is deployed (kubectl apply) after the ingress-nginx controller is applayed,
+#   the controller my need to reapply its LoadBalancer to catch up with the new Ingress rules.
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   frontend -- referenced by ./ingress.yaml (backend.service.name) and README's `port-forward svc/frontend` examples
+# REFERENCES:
+#   app.kubernetes.io/name: frontend (pod label) -- defined in ../controllers/frontend-deployment.yaml
+#   fe-deploy-port -- defined in ../controllers/frontend-deployment.yaml (containers[].ports)
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Stable in-cluster name and load balancer for the items-frontend (nginx) pods; what ingress.yaml routes / to"
+spec:
+  type: ClusterIP
+  sessionAffinity: None
+  ipFamilyPolicy: SingleStack
+  ipFamilies: ["IPv4"]
+  # Common fields missing: clusterIP, externalName, externalTrafficPolicy
+  selector:
+    app.kubernetes.io/name: frontend
+  ports:
+    - name: fe-service-port
+      protocol: TCP
+      port: 80
+      targetPort: fe-deploy-port
+      # Common fields missing: nodePort

@@ -1,0 +1,57 @@
+# Purpose: scales pod count up under real load and back down when it's quiet,
+# instead of running enough replicas for peak traffic 24/7.
+# Requires a metrics-server running in the cluster to actually scale -- without one,
+# this object exists but never has metrics to act on.
+#   kubectl get hpa backend-hpa -n docker-kubernetes-app -w   # watch it react to real load
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   backend-hpa -- not referenced by name anywhere else
+# REFERENCES:
+#   backend-deployment -- defined in ../controllers/backend-deployment.yaml (scaleTargetRef.name)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Scales the backend Deployment between 2 and 6 replicas on CPU and memory utilization"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend-deployment
+  minReplicas: 2
+  maxReplicas: 6
+  # scale up fast (up to 2 more Pods per minute), scale down slowly (at most half the Pods per minute, after 5 quiet minutes)
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+    # Common fields missing: other metric types (Pods, Object, External, ContainerResource)

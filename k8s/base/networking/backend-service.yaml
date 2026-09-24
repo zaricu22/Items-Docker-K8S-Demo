@@ -1,0 +1,40 @@
+# Purpose: a stable cluster-level DNS name and internally load-balanced entry point for backend pods,
+# because pods change IP on every restart/reschedule (but service-level defined address doesn't).
+#
+# Ingress:
+#   ingress.yaml targets this Service by name.
+#   If Ingress object is deployed (kubectl apply) after the ingress-nginx controller is applayed,
+#   the controller my need to reapply its LoadBalancer to catch up with the new Ingress rules.
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   backend -- referenced by ./ingress.yaml (backend.service.name)
+#   backend -- referenced by ../../../frontend/nginx.conf (proxy_pass http://backend:8080, a file outside k8s/ entirely)
+# REFERENCES:
+#   app.kubernetes.io/name: backend (pod label) -- defined in ../controllers/backend-deployment.yaml
+#   be-deploy-port -- defined in ../controllers/backend-deployment.yaml (containers[].ports)
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Stable in-cluster name and load balancer for the items-api pods"
+spec:
+  type: ClusterIP
+  sessionAffinity: None
+  ipFamilyPolicy: SingleStack
+  ipFamilies: ["IPv4"]
+  # Common fields missing: clusterIP, externalName, externalTrafficPolicy
+  selector:
+    app.kubernetes.io/name: backend
+  ports:
+    - name: be-service-port
+      protocol: TCP
+      port: 8080
+      targetPort: be-deploy-port
+      # Common fields missing: nodePort

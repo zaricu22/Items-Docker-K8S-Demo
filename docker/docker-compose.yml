@@ -1,0 +1,348 @@
+# Compose Specification file: no top-level `version:` key needed (deprecated).
+# `compose.yaml` is the modern default filename; `docker-compose.yml` is kept because it's more recognizable.
+#
+# backend, frontend and worker are real, minimal apps and build/run as-is.
+# Run from the repo root so paths match the rest of the docs:
+#
+#   docker compose -f docker/docker-compose.yml config       # resolve + validate, print final config
+#   docker compose -f docker/docker-compose.yml up --build   # build + run db-migration, backend, frontend, worker, database
+#
+# Dev variant: layers docker-compose.dev.yml on top (later -f files override earlier ones):
+#
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up --build --watch
+#
+# Then open http://localhost:8080 and click the button: "Hello from Backend" comes back via frontend's nginx proxy.
+
+# Fixes the project name (prefix of every network/volume/secret); otherwise it defaults to the folder name ("docker").
+name: docker-kubernetes-app
+
+## -----------------------------  ANCHORS ----------------------------------------
+# SYNTAX NOTE:
+#     &name — an anchor. - predefined list of key: value
+#     *name — an alias. - reference to the anchor, there is no other block after it
+#          logging: *default-logging   -- nothing else for logging: key
+#     <<: — the merge key. - reference to the anchor, merge the key: value into the current block
+#            frontend:
+#               <<: *hardened
+#               labels: ...   -- then add more keys to the block
+
+# YAML anchor: define logging options once, reuse them per service instead of repeating the block.
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Same idea for hardening, merged into a service with `<<: *hardened` (counterpart of the k8s securityContext).
+# Anything the app needs to write must then be listed explicitly (`tmpfs:` / named volumes).
+x-hardened: &hardened
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  # pids cap moved to each service's own deploy.resources.limits.pids -- Compose v5 rejects a service
+  # having both the legacy top-level pids_limit and its own deploy.resources.limits block at once
+  # ("can't set distinct values on 'pids_limit' and 'deploy.resources.limits.pids'").
+
+# Shared label, merged into each service's `labels:` and reused on the networks and volumes below (same key as the k8s manifests).
+x-part-of: &part-of
+  app.kubernetes.io/part-of: docker-kubernetes-app
+
+
+## -----------------------------  SERVICES ----------------------------------------
+# Common service fields missing: container_name, hostname, working_dir, entrypoint, stop_signal, ulimits, sysctls, shm_size, extra_hosts, dns, scale.
+# Common service fields missing: pre_stop / post_start hooks (Compose 2.30+), deploy.replicas, deploy.restart_policy.
+# Common service fields missing: build.platforms / cache_from / cache_to / secrets (need a multi-platform-capable builder), tmpfs size options, secrets long syntax (uid/gid/mode).
+# Common file features missing: `${VAR:?error}` required-variable interpolation, extends, include, !reset / !override merge tags.
+services:
+  frontend:
+    <<: *hardened
+    labels:
+      <<: *part-of
+      app.kubernetes.io/name: frontend
+      app.kubernetes.io/component: web
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      target: runtime   # a Dockerfile stage by name; here the final one (the default), `build` would stop after the Angular build
+      args:
+        NODE_VERSION: ${NODE_VERSION:-20}   # from docker/.env, default 20
+    environment:
+      NGINX_ENTRYPOINT_QUIET_LOGS: "1"   # silences nginx's startup notices about its read-only config dir
+    ports:
+      - "127.0.0.1:8080:4200"   # host_ip:host:container -- loopback only, so the dev port isn't reachable from the LAN; EXPOSE only documents 4200, this line publishes it
+    tmpfs:
+      - /var/cache/nginx        # nginx still needs a writable cache dir and pid file: in-memory, wiped on restart (like the k8s emptyDirs).
+      - /var/run
+    deploy:
+      resources:
+        limits:   # hard cgroup ceiling (like k8s `limits:`); exceeding memory means OOM-kill
+          cpus: "0.2"
+          memory: 128M
+          pids: 256   # caps processes/threads (fork-bomb guard)
+        reservations:   # soft guarantee (like a k8s `requests:`), memory only
+          memory: 64M
+    depends_on:
+      backend:
+        condition: service_healthy   # waits for backend's HEALTHCHECK, not just "container started"
+        restart: true   # restarts frontend when backend is restarted or recreated: nginx resolves `backend` once at startup and would keep the old IP
+    networks:
+      - app-net
+      # not on db-net: the frontend has no business, so no need for Postgres
+    restart: unless-stopped     # a continuous long-running container
+    logging: *default-logging
+
+  backend:
+    <<: *hardened
+    labels:
+      <<: *part-of
+      app.kubernetes.io/name: backend
+      app.kubernetes.io/component: api
+    build:
+      context: ../backend
+      target: runtime   # final stage of backend/Dockerfile (the default); `build` would stop after Maven
+      args:
+        JAVA_VERSION: ${JAVA_VERSION:-21}
+    # bulk KEY=VALUE file, environment: cannot easily parse read from a file
+    env_file:
+      - path: ../backend/.env
+        required: true
+      - path: ../backend/.env.local   # optional local overrides, later files win
+        required: false
+    # hardcoded strings or variables defined within this Compose file
+    environment:
+      APP_ENV: demo   # wins over the same key from env_file
+    secrets:
+      - api_token
+    networks:
+      - app-net   # reachable by frontend
+      - db-net    # with db-migration/worker services, the only ones that can reach Postgres
+    expose:
+      - "8080"   # reachable by other containers on the shared network only; nothing is published on the host
+    volumes:
+      - backend-data:/app/data   # named volume: survives `down` (not `down -v`); the app doesn't write here, it only demonstrates the concept (k8s uses an emptyDir at this path, its PVC counterpart is db-data)
+    tmpfs:
+      - /tmp   # JVM/Tomcat scratch space (like the k8s emptyDir at /tmp)
+    # init: true - activate 'tini' as PID 1 that forwards signals (from shell to its child) and reaps zombies (kill also detached subprocesses).
+    # stop_grace_period: wait after SIGTERM before SIGKILL (default 10s); matches terminationGracePeriodSeconds: 30 in k8s.
+    init: true
+    stop_grace_period: 30s
+    # The app never queries Postgres; these dependencies only demonstrate `depends_on`: `service_healthy`.
+    depends_on:
+      database:
+        condition: service_healthy
+      db-migration:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+          pids: 256   # caps processes/threads (fork-bomb guard); generous for a JVM
+        reservations:
+          memory: 128M
+    restart: unless-stopped   # a continuous long-running container
+    logging: *default-logging
+
+  # Real, minimal Go binary (stdlib only): logs container's load average and available memory on an WORKER_INTERVAL, reading /proc dir directly;
+  # no DB, no network, no profile, no dependencies, no other service to wait on, so it starts independently of everything else here.
+  # Demonstrate a one-shot container which execute worker's Dockerfile example with own illustrated concepts.
+  worker:
+    <<: *hardened
+    labels:
+      <<: *part-of
+      app.kubernetes.io/name: worker
+      app.kubernetes.io/component: node-agent
+    build:
+      context: ./worker
+    environment:
+      WORKER_INTERVAL: 30s
+    network_mode: "none"    # No outbound or inbound traffic at all, so it gets no network -- mutually exclusive with `networks:`.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 32M
+          pids: 64   # caps processes/threads (fork-bomb guard); a single Go binary needs far fewer than the JVM
+        reservations:
+          memory: 16M
+    restart: unless-stopped   # a continuous background agent, unlike the one-shot db-migration
+    logging: *default-logging
+
+  database:
+    labels:
+      <<: *part-of
+      app.kubernetes.io/name: database
+      app.kubernetes.io/component: database
+    image: postgres:16-alpine
+    pull_policy: missing   # same as k8s imagePullPolicy: IfNotPresent
+    # hardcoded strings and file-based secrets
+    environment:
+      POSTGRES_DB: items
+      POSTGRES_USER: items
+      POSTGRES_PASSWORD_FILE: /run/secrets/api_token   # stand-in: reuses the backend's api_token (k8s uses a separate database-secret)
+    secrets:
+      - api_token
+    volumes:
+      - db-data:/var/lib/postgresql/data  # official postgres image's actual data directory (PGDATA)
+    networks:
+      - db-net   # internal network only: no route in from frontend, none out to the internet
+    expose:
+      - "5432"   # for other containers on 'db-net' only; nothing is published on the host
+    # Only no-new-privileges, not the full `*hardened` block: so it needs root capabilities and a writable filesystem.
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "items"]  # "CMD-SHELL" is the alternative for pipes, &&/||, redirection
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s   # failures during the first 10s (initdb on a fresh volume) don't count toward `retries`
+    restart: unless-stopped  # a continuous long-running service
+    logging: *default-logging
+
+  # One-shot service (like migration-job.yaml): waits for a healthy Postgres, creates the `items` table, exits 0.
+  # backend's `service_completed_successfully` enforces that order.
+  db-migration:
+    <<: *hardened
+    labels:
+      <<: *part-of
+      app.kubernetes.io/name: database
+      app.kubernetes.io/component: migration
+    image: postgres:16-alpine   # same image as the database, so psql matches the server version
+    pull_policy: missing   # only pull if not present locally (the default; same as k8s imagePullPolicy: IfNotPresent)
+    user: "70:70"   # the `postgres` user of the alpine image, as in migration-job.yaml
+    # hardcoded strings (alternative file-based) secrets
+    environment:
+      PGHOST: database
+      PGUSER: items
+      PGDATABASE: items
+      # psql only reads PGPASSWORD (no *_FILE variant), so the secret is passed in for this one process; `$$` escapes a literal `$`.
+    command:
+      - sh
+      - -c
+      - PGPASSWORD="$$(cat /run/secrets/api_token)" psql -v ON_ERROR_STOP=1 -f /migrations/create-items-table-script.sql
+    secrets:
+      - api_token
+    configs:
+      - source: items_schema   # non-secret file, mounted read-only instead of baked into an image
+        target: /migrations/create-items-table-script.sql
+    networks:
+      - db-net
+    depends_on:
+      database:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 128M
+          pids: 64   # caps processes/threads (fork-bomb guard)
+        reservations:
+          memory: 64M
+    restart: "no"   # runs once and exits; restarting would re-run it forever
+    logging: *default-logging
+
+  # One-shot service (like backup-job.yaml): waits for a healthy Postgres, runs `pg_dump`, exits 0.
+  # Profiles are opt-in: `docker compose up` never starts these, but `docker compose --profile tools up` does.
+  #   docker compose -f docker/docker-compose.yml --profile tools run --rm db-backup > backup.sql
+  #     `run` starts container for single-named service, waits for it to finish, and shows its output on stdout.
+  #     `--rm service-name` removes the container after it exits, and the SQL dump is streamed to stdout (no local file needed).
+  #     `>` just redirects stdout to a file, so the dump is saved as `backup.sql` on the host.
+  db-backup:
+    profiles:
+      - tools   # opt-in only: plain `docker compose up` never starts this
+    <<: *hardened
+    labels:
+      <<: *part-of
+      app.kubernetes.io/name: database
+      app.kubernetes.io/component: backup
+    image: postgres:16-alpine   # ships pg_dump, matching the server's own version
+    pull_policy: missing
+    # hardcoded strings (alternative file-based) secrets
+    environment:
+      PGHOST: database
+      PGUSER: items
+      PGDATABASE: items
+    # Same PGPASSWORD/`$$` pattern as db-migration above; pg_dump streams the SQL to stdout, no local file needed.
+    #   docker compose commands redirect stdout to a file on the host, so the dump is saved as `backup.sql` on the host.
+    command:
+      - sh
+      - -c
+      - PGPASSWORD="$$(cat /run/secrets/api_token)" pg_dump --clean --if-exists
+    secrets:
+      - api_token
+    networks:
+      - db-net
+    depends_on:
+      database:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          pids: 64   # caps processes/threads (fork-bomb guard) -- kept even without cpu/memory limits, to match the other hardened services
+    restart: "no"   # a one-shot dump, run on demand via `--profile tools run`, never long-lived via `up`
+    logging: *default-logging
+
+
+## -----------------------------  RESOURCES ----------------------------------------
+# Common fields missing: name, external, driver, driver_opts
+# 'Named volumes' filesystems to persist data across container restarts, like k8s PersistentVolumeClaims (PVCs).
+volumes:
+  backend-data:
+    labels: *part-of
+  db-data:
+    labels: *part-of
+
+# Common fields missing: external, ipam, driver_opts, attachable (and per-service `aliases` under `networks:`)
+# Two purpose: Addressing containers just by its name (like k8s DNS) and container-isolation from other ones (like k8s NetworkPolicy).
+networks:
+  app-net:
+    driver: bridge   # custom bridge: DNS by service/container name, also isolated from projects' default network
+    labels: *part-of
+  db-net:
+    driver: bridge   # custom bridge: same as above
+    internal: true   # no outside gateway; isolated from any other projects' network (in spirit like the k8s NetworkPolicy, which restricts only the backend pods)
+    labels: *part-of
+
+# Common fields missing: external
+# Visible by docker compose config commands.
+configs:
+  # Like `secrets:`, but for non-sensitive files: mounted read-only (mode 0444) at /<name>, or at `target:` if set.
+  items_schema:
+    file: ./migrations/create-items-table-script.sql
+
+# Common fields missing: environment (take the secret from an env var instead of a file)
+secrets:
+  # File-based secret: ./secrets/api_token.txt is exposed only under /run/secrets/ in services that list it, never as an env var.
+  api_token:
+    file: ./secrets/api_token.txt
+
+  # Env-based secret: value taken from an environment variable (e.g., `export CI_SIGNING_KEY=...` before docker compose), instead of a file.
+  ci_signing_key:
+    environment: CI_SIGNING_KEY
+
+  # External: references a secret created outside this file (`docker secret create ...`) by name, instead of Compose creating one.
+  #   docker swarm init && docker secret create db-root-password -   # (paste value, Ctrl+D) -- prerequisite, not used by plain Compose
+  db_root_password:
+    external: true
+    name: db-root-password
+
+  # Driver-based: value fetched live from an external store (Vault, AWS Secrets Manager, ...) via a plugin, instead of a static file/env var.
+  # Shown as a comment, not live YAML: this Compose CLI version (v5.5.0) rejects a secret that only
+  # declares `driver:` -- it insists on `file:`/`environment:` too, which would defeat the point (the
+  # whole reason for a driver is NOT having a local file/env var). A real driver-based secret:
+  #   docker plugin install sugar-org/swarm-external-secrets && docker plugin set swarm-external-secrets:latest SECRETS_PROVIDER="aws"
+  #   db_password_aws:
+  #     driver: swarm-external-secrets
+  #     labels:
+  #       aws_secret_name: docker-kubernetes-app/db-password
+  #       aws_field: password

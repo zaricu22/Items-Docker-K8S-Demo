@@ -1,0 +1,76 @@
+# Purpose: locks down items-api's network access to exactly what it needs
+# -- inbound only from the frontend (or a real Ingress controller, see
+# below), outbound only to the database and DNS -- so a compromised
+# backend pod can't freely reach (or be reached by) anything else in the
+# cluster. Default-deny-by-selection: once any NetworkPolicy selects a
+# pod, only traffic explicitly allowed here is permitted -- everything
+# else to/from these pods is dropped by the CNI plugin (if it enforces
+# policies; not all do).
+#   kubectl exec deploy/frontend-deployment -n docker-kubernetes-app -- wget -qO- database:5432   # should be refused if enforced
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   backend-network-policy -- not referenced by name anywhere else
+#   (NetworkPolicy objects are never referenced by other objects; the CNI
+#   plugin just applies every NetworkPolicy whose podSelector matches a
+#   given pod)
+# REFERENCES:
+#   app.kubernetes.io/name: backend (pod label) -- defined in ../controllers/backend-deployment.yaml (podSelector -- who this whole policy applies to)
+#   app.kubernetes.io/name: frontend (pod label) -- defined in ../controllers/frontend-deployment.yaml (ingress from)
+#   app.kubernetes.io/name: database (pod label) -- defined in ../controllers/database-statefulset.yaml (egress to)
+#   a namespace named "ingress-nginx" -- not defined anywhere in this repo.
+#   kubernetes.io/metadata.name is a label Kubernetes auto-applies to every
+#   namespace (its own name, mirrored as a label so it can be selected on)
+#   -- this points at whatever separate ingress-nginx installation you
+#   applied outside k8s/base/ entirely.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-network-policy
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Backend Pods accept traffic only from the frontend and ingress-nginx, and reach only the database and DNS"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: frontend
+        # Common fields missing: ipBlock
+      ports:
+        - port: 8080
+          # Common fields missing: endPort
+    # A real Ingress controller (e.g. ingress-nginx) routes directly to
+    # backend pod IPs rather than through backend-service.yaml -- bypassing
+    # kube-proxy entirely for performance, as covered in the README. Without
+    # this rule, that traffic is indistinguishable from any other unrelated
+    # pod trying to reach backend, and gets silently dropped, timing out.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8080
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: database
+        # Common fields missing: ipBlock
+      ports:
+        - port: 5432
+          # Common fields missing: endPort
+    - to:   # DNS -- otherwise service-name resolution breaks under a default-deny egress policy
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

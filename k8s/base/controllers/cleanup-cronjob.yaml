@@ -1,0 +1,120 @@
+# Usual use-cases (CronJob): recurring, finite tasks on a clock schedule;
+# nightly cleanups, database backups, report generation, periodic data syncs.
+#
+# Two scheduling types: time-schedule (cronjob) vs node-placement scheduling (deployment)
+#   Node-placement scheduling: which node it runs on, decided using resource requests, affinity/podAntiAffinity, topologySpreadConstraints, tolerations. Nothing to do with time.
+#   Time-schedule: when a Job gets created, decided by the CronJob controller watching the clock. Nothing to do with nodes.
+#
+#   kubectl create job --from=cronjob/nightly-cleanup manual-cleanup -n docker-kubernetes-app   # run it now, outside the 02:00 schedule
+# Purpose: a real recurring maintenance task the always-on Deployments shouldn't own --
+# every night at 02:00 UTC it deletes rows older than 30 days from the `items` table
+# (the table is created by migration-job.yaml, so that Job must have run once first).
+# A CronJob creates a Job on a schedule, the same relationship a Deployment has to its ReplicaSets/Pods.
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   nightly-cleanup -- not referenced by name anywhere else, same as migration-job.yaml's db-migration
+# REFERENCES:
+#   database -- Service defined in ../networking/database-service.yaml (PGHOST)
+#   database-secret -- defined in ../config/database-secret.yaml (PGPASSWORD)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-cleanup
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: database
+    app.kubernetes.io/component: maintenance
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Nightly cleanup: deletes items rows older than 30 days from Postgres"
+spec:
+  schedule: "0 2 * * *"
+  timeZone: Etc/UTC          # without this the schedule follows the cluster's own (unspecified) time zone
+  startingDeadlineSeconds: 300   # if a run cannot start within 5 minutes of its scheduled time, skip it
+  suspend: false
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  # One extra layer of nesting versus the other controllers here:
+  # CronJob wraps a Job template (jobTemplate.spec), which itself wraps a Pod template;
+  # CronJob -> Job -> Pod, mirroring migration-job.yaml's own Job -> Pod nesting one level deeper.
+  jobTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/name: database
+        app.kubernetes.io/component: maintenance
+        app.kubernetes.io/part-of: docker-kubernetes-app
+    spec:
+      completions: 1
+      parallelism: 1
+      activeDeadlineSeconds: 600         # a cleanup that runs longer than 10 minutes is stopped
+      ttlSecondsAfterFinished: 86400     # finished Jobs are removed after a day (the history limits above apply first)
+      backoffLimit: 1
+      # ===== POD ===== everything from `template:` down to the end of this file IS the Pod;
+      # that a Job created on this schedule runs.
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: database
+            app.kubernetes.io/component: maintenance
+            app.kubernetes.io/part-of: docker-kubernetes-app
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: default
+          automountServiceAccountToken: false   # psql never calls the Kubernetes API, so the Pod gets no token
+          dnsPolicy: ClusterFirst
+          hostNetwork: false
+          nodeSelector:
+            kubernetes.io/os: linux
+          # Common fields missing: initContainers, volumes, affinity, imagePullSecrets, priorityClassName
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 70   # the `postgres` user baked into the alpine image
+            runAsGroup: 70
+            seccompProfile:
+              type: RuntimeDefault
+          tolerations:
+            - key: "node-role.kubernetes.io/control-plane"
+              operator: "Exists"
+              effect: "NoSchedule"
+          # ---- CONTAINERS ---- the containers that run for this Pod;
+          # once this one exits, the Pod (and that Job) is done.
+          containers:
+            - name: cleanup
+              # Same image as the database itself, so psql always matches the server version.
+              image: postgres:16-alpine
+              imagePullPolicy: IfNotPresent
+              # Common fields missing: args
+              command:
+                - sh
+                - -c
+                - psql -c "DELETE FROM items WHERE created_at < now() - interval '30 days'"
+              # Common fields missing: envFrom, workingDir, volumeMounts, ports
+              # PG* variables: read by psql for host, user, database and password, so the command needs no flags
+              env:
+                - name: PGHOST
+                  value: database
+                - name: PGUSER
+                  value: items
+                - name: PGDATABASE
+                  value: items
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: database-secret
+                      key: POSTGRES_PASSWORD
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 70   # the `postgres` user baked into the alpine image
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]

@@ -1,0 +1,32 @@
+# Purpose: prod-specific tweaks on top of the shared base.
+# Nothing here edits k8s/base/ itself; it's all layered on top.
+#
+#   kubectl kustomize k8s/overlays/prod/     # render + validate locally, no cluster needed
+#   kubectl apply -k k8s/overlays/prod/      # actually apply this environment's version
+#
+# What an overlay can and can't do to the base, compared to a Compose override file
+# (docker/docker-compose.dev.yml) -- same rules as k8s/overlays/dev/kustomization.yaml:
+#   - EDIT an existing object's fields    -- yes, see backend-replicas.yaml and
+#     frontend-replicas.yaml below (both only set Deployment.spec.replicas)
+#   - ADD a new field to an existing object -- not demonstrated here either
+#   - ADD a brand-new object              -- not demonstrated in this overlay: unlike dev's
+#     frontend-localhost.yaml, prod adds nothing under `resources:` beyond ../../base
+#   - REMOVE an object the base defines   -- not used here, but Kustomize supports it natively
+#     (a patch file with just `$patch: delete` plus the same apiVersion/kind/metadata.name) --
+#     unlike a Compose override file, which has no equivalent
+
+# The one line that ties this overlay to the shared base
+resources:
+  - ../../base
+
+# same as for Dev, each patch overrides only the fields it sets, matched by apiVersion+kind+metadata.name
+patches:
+  - path: backend-replicas.yaml
+  - path: frontend-replicas.yaml
+
+# same as for Dev, rewrites the tag on any image whose repository matches, wherever it appears in the base
+images:
+  - name: docker-kubernetes-app/backend
+    newTag: prod
+  - name: docker-kubernetes-app/frontend
+    newTag: prod

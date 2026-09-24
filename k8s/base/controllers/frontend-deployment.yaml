@@ -1,0 +1,155 @@
+# Usual use-cases (Deployment): stateless, always-on services whose Pods are interchangeable;
+# web frontends, REST APIs, queue consumers. Scale by changing the replica count.
+#
+# Two scheduling types: time-schedule (cronjob) vs node-placement scheduling (deployment)
+#   Node-placement scheduling: which node it runs on, decided using resource requests, affinity/podAntiAffinity, topologySpreadConstraints, tolerations. Nothing to do with time.
+#   Time-schedule: when a Job gets created, decided by the CronJob controller watching the clock. Nothing to do with nodes.
+#
+# Purpose: Defines the frontend pods (scheduler template) and its containers and how they run.
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   app.kubernetes.io/name: frontend (pod label) -- referenced by ../networking/frontend-service.yaml (selector)
+#   app.kubernetes.io/name: frontend (pod label) -- referenced by ../networking/networkpolicy.yaml (ingress from)
+#   fe-deploy-port -- referenced by ../networking/frontend-service.yaml and
+#   ../../overlays/dev/frontend-localhost.yaml (both targetPort)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-deployment
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "items-frontend (Angular static files served by nginx): self-healing replicas behind the frontend Service"
+spec:
+  # running fixed number of pod's replicas (2), all at time,
+  # restarts crashed ones, rolls them out without downtime (auto-healing).
+  replicas: 2
+  revisionHistoryLimit: 3
+  minReadySeconds: 5            # a new Pod must stay Ready this long before it counts as available
+  progressDeadlineSeconds: 600  # a rollout that makes no progress for 10 minutes is reported as failed
+  paused: false
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  # ===== POD ===== everything from `template:` down to the end of this file IS the Pod --
+  # the Deployment above it only says "keep 2 copies of this Pod running."
+  # Nothing above this line describes a running thing.
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frontend
+        app.kubernetes.io/component: web
+        app.kubernetes.io/part-of: docker-kubernetes-app
+    spec:
+      serviceAccountName: default
+      automountServiceAccountToken: false   # nginx never calls the Kubernetes API, so it gets no token
+      terminationGracePeriodSeconds: 30
+      restartPolicy: Always   # the only value a Deployment allows
+      dnsPolicy: ClusterFirst
+      hostNetwork: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      # Common fields missing: initContainers, imagePullSecrets, priorityClassName
+      # runAsUser/runAsGroup pinned to the nginx image's own "nginx" user (uid/gid 101 in nginx:1.27-alpine) as explicit numbers,
+      # the Dockerfile's `USER nginx` sets that same user by *name*, but recent kubelet versions refuse to start a container under,
+      # runAsNonRoot:true unless the non-root user can be verified numerically; a named USER alone isn't enough for that check.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      # ---- CONTAINERS ---- the container(s) that actually keep running for the Pod's lifetime.
+      # This Pod has only one Container (but can list more than one).
+      # No init containers this time (like for Backend).
+      containers:
+        - name: frontend
+          image: docker-kubernetes-app/frontend:latest
+          # Always forces every pod (re)start to re-check the local :latest tag instead of trusting whatever was cached.
+          # Needed here because this image is only ever built locally and never re-tagged,
+          # so IfNotPresent would silently keep running stale code even after a fresh docker build.
+          imagePullPolicy: Always
+          # Common fields missing: command, args
+          workingDir: /usr/share/nginx/html   # where the compiled Angular files live
+          # Common fields missing: envFrom
+          env:
+            - name: NGINX_ENTRYPOINT_QUIET_LOGS   # silences the nginx image's startup notices about its read-only config directory
+              value: "1"
+          ports:
+            - name: fe-deploy-port
+              containerPort: 4200
+          startupProbe:
+            httpGet:
+              path: /
+              port: fe-deploy-port
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /
+              port: fe-deploy-port
+          livenessProbe:
+            httpGet:
+              path: /
+              port: fe-deploy-port
+          lifecycle:
+            # Common fields missing: postStart
+            # preStop waits so the Service stops routing here before shutdown begins
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # nginx needs to write its cache dir and pid file even when the container's own root filesystem is read-only,
+          # so mount those two paths as writable emptyDirs instead of relaxing readOnlyRootFilesystem (defined above).
+          volumeMounts:
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+      volumes:
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+      # Best-effort spread across nodes -- "preferred", not "required",
+      # so scheduling still succeeds even though affinity rules can't be satisfied.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: frontend
+                topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: frontend
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"

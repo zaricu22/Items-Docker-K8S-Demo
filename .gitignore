@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.angular/
+target/
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
+.vscode/*
+!.vscode/settings.json
+
+# Per-developer overrides, never the shared committed .env files (backend/.env, docker/.env)
+.env.local
+
+# Real value for the docker/worker/Dockerfile's --mount=type=secret demo -- never commit this.
+docker/worker/build_token.txt

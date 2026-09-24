@@ -1,0 +1,66 @@
+# Layered on top of 'base' docker-compose.yml -- in docker command later -f means that files override/extend earlier ones,
+# so this file only lists what differs for local development (the Compose analog of k8s/overlays/dev/ patching k8s/base/):
+#
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up --build --watch
+#
+# Compose resolves the relative paths below against the first -f file's directory (docker/).
+#
+# What an override file can and can't do to the base, compared to a Kustomize overlay:
+#   - EDIT an existing service's fields         -- yes, see backend.environment.APP_ENV below
+#   - ADD new fields to an existing service     -- yes, see backend.environment.LOG_LEVEL below
+#   - ADD a brand-new service                   -- yes, see `adminer` below
+#   - REMOVE a service the base file defines    -- no native equivalent to Kustomize's
+#     `$patch: delete`; `profiles:` can keep a service from *starting*, but it stays part
+#     of the merged config either way
+
+# Override existing and add new services
+services:
+  backend:
+    # EDIT existing vs ADD new fields
+    environment:
+      APP_ENV: local   # EDIT: same key as the base file's `APP_ENV: demo` -- the later file's value wins, base's other keys are untouched
+      LOG_LEVEL: debug # ADD: a key the base file never set, merged in alongside APP_ENV
+    # ADD new fields
+    # Compose Watch: for dev purpose, rebuild container on file changes in backend/src or backend/pom.xml.
+    develop:
+      watch:
+        - action: rebuild
+          path: ../backend/src
+        - action: rebuild
+          path: ../backend/pom.xml
+
+  frontend:
+    # ADD new fields
+    # Base compose file defines only 'named volumes' filesystem like: backend: volumes: backend-data and database: volumes: db-data,
+    # but frontend: only involve default writable_layer (overlay2) which is not persisted across container rebuilds.
+    #
+    # Bind mount filesystem is mapped to existing host file, so that the container can read it directly from host filesystem.
+    # We want to replace the default writable layer with a bind mount for frontend: container which will persist rebuilds.
+    volumes:
+      - type: bind
+        source: ../frontend/nginx.conf
+        target: /etc/nginx/conf.d/default.conf
+        read_only: true
+        bind:
+          create_host_path: false
+    # same as above
+    develop:
+      watch:
+        - action: rebuild
+          path: ../frontend/src
+        - action: rebuild
+          path: ../frontend/package.json
+
+  # ADD brand-new service:
+  # a dev-only DB browser, not in the base compose file at all;
+  # an override file can introduce any top-level service key the base never declared.
+  adminer:
+    image: adminer:4.8.1
+    ports:
+      - "127.0.0.1:8081:8080"   # loopback only, like frontend's dev port
+    networks:
+      - db-net   # reach `database` by its Compose DNS name, same network backend uses
+    depends_on:
+      database:
+        condition: service_healthy
+    restart: unless-stopped

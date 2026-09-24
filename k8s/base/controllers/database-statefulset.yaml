@@ -1,0 +1,156 @@
+# Usual use-cases (StatefulSet): stateful workloads where each Pod needs a stable name and its own disk;
+# databases (Postgres, MySQL), message brokers (Kafka, RabbitMQ), clustered stores (etcd, Elasticsearch).
+#
+# Purpose: runs Postgres with a stable identity and its own persistent disk per pod;
+# a Deployment can't give either of those, which is why the database gets a StatefulSet instead of joining backend/frontend as one.
+# Depends on the headless Service in for the stable DNS name each pod gets (`serviceName: database` below).
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   app.kubernetes.io/name: database (pod label) -- referenced by ../networking/database-service.yaml (selector)
+#   app.kubernetes.io/name: database (pod label) -- referenced by ../networking/networkpolicy.yaml (egress to)
+#   db-deploy-port -- referenced by ../networking/database-service.yaml (targetPort)
+# REFERENCES:
+#   database -- Service defined in ../networking/database-service.yaml (serviceName below)
+#   database-secret -- defined in ../config/database-secret.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: database-statefulset
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: database
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Postgres with a stable Pod name (database-0) and its own persistent volume"
+spec:
+  serviceName: database
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  # keep the volume when the StatefulSet is deleted or scaled down, so deleting the workload never deletes the data
+  #   kubectl delete statefulset database-statefulset -n docker-kubernetes-app && kubectl get pvc -n docker-kubernetes-app   # PVC should still be there
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  revisionHistoryLimit: 3
+  minReadySeconds: 5   # a new Pod must stay Ready this long before it counts as available
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: database
+  # ===== POD ===== this `template:` block (through its `containers:`) IS the Pod;
+  # the StatefulSet says "keep 1 copy running, with a stable name (database-0)."
+  # `volumeClaimTemplates:` below is a sibling of this block, not part of it -- it's what gives that Pod its own PVC.
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: database
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: docker-kubernetes-app
+    spec:
+      serviceAccountName: default
+      automountServiceAccountToken: false   # Postgres never calls the Kubernetes API, so it gets no token
+      terminationGracePeriodSeconds: 60     # room for a clean database shutdown
+      nodeSelector:
+        kubernetes.io/os: linux
+      # Common fields missing: initContainers, affinity, topologySpreadConstraints, imagePullSecrets, priorityClassName
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70          # the `postgres` user baked into the alpine image
+        runAsGroup: 70
+        fsGroup: 70
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+      # ---- CONTAINERS ---- the container(s) that actually keep running for the Pod's lifetime;
+      # just Postgres itself here.
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent   # public image with a pinned tag, so a cached copy is always the right one
+          # Common fields missing: command
+          args:
+            - -c
+            - max_connections=50     # this app needs a handful of connections, not the default 100
+            - -c
+            - shared_buffers=64MB    # sized for the 512Mi memory limit below
+          ports:
+            - name: db-deploy-port
+              containerPort: 5432
+          # Common fields missing: envFrom
+          env:
+            - name: POSTGRES_DB
+              value: items
+            - name: POSTGRES_USER
+              value: items
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: database-secret
+                  key: POSTGRES_PASSWORD
+            # A non-root Postgres cannot set permissions on the mount root, which the volume provisioner creates owned by
+            # root; a sub-directory it creates itself avoids that.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "items", "-d", "items"]
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "items", "-d", "items"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "items", "-d", "items"]
+            periodSeconds: 10
+            failureThreshold: 6
+          lifecycle:
+            # Common fields missing: postStart
+            # preStop asks Postgres for a fast, clean shutdown
+            preStop:
+              exec:
+                command: ["pg_ctl", "stop", "-m", "fast", "-D", "/var/lib/postgresql/data/pgdata"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            # with a read-only root filesystem, Postgres still needs a writable socket directory and /tmp
+            - name: postgres-run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: postgres-run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  # One PVC per pod, provisioned automatically from this template;
+  # this is what makes a StatefulSet's storage different from a Deployment's.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        # Common fields missing: storageClassName
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

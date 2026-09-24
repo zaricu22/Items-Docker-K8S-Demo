@@ -1,0 +1,8 @@
+# Purpose: overrides just the LOG_LEVEL key in the base ConfigMap's `data`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: docker-kubernetes-app
+data:
+  LOG_LEVEL: debug

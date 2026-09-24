@@ -1,0 +1,35 @@
+# Purpose: additive Service object (ClusterIP:4300) that exists alongside the base frontend Service(ClusterIP:80),
+# both points on the same Pod's targetPort, from common Cluster's IP address, but on different ports.
+#
+# ROUTING:
+#   :4300 → direct. frontend-dev-localhost is itself type: LoadBalancer, so wslrelay binds its port 4300 straight onto your Windows localhost:4300.
+#   Your browser's request goes: localhost:4300 → wslrelay → frontend-dev-localhost's ClusterIP → the Pod.
+#
+#   :80 → indirect, through ingress-nginx-controller's own separate LoadBalancer Service
+#   Your browser's request goes: localhost:80 → wslrelay → ingress-nginx-controller's ClusterIP → the ingress-nginx pod
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-dev-localhost
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Dev-only LoadBalancer: publishes the frontend straight on localhost:4300, bypassing the Ingress"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster
+  sessionAffinity: None
+  ipFamilyPolicy: SingleStack
+  ipFamilies: ["IPv4"]
+  # Common fields missing: clusterIP, externalName, loadBalancerSourceRanges, loadBalancerClass
+  selector:
+    app.kubernetes.io/name: frontend
+  ports:
+    - name: fe-dev-port
+      protocol: TCP
+      port: 4300
+      targetPort: fe-deploy-port
+      # Common fields missing: nodePort

@@ -1,0 +1,67 @@
+# Purpose: the single external entry point into the cluster for this app --
+# routes /api/* to items-api (backend-service.yaml) and everything else to items-frontend,
+# so both live behind one hostname instead of needing separate public endpoints (IPs/hostnames).
+#
+# If Ingress object is deployed (kubectl apply) after the ingress-nginx controller is applayed,
+# the controller my need to reapply its LoadBalancer to catch up with the new Ingress rules.
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   app-ingress -- not referenced by name anywhere else
+# REFERENCES:
+#   backend -- Service defined in ./backend-service.yaml
+#   frontend -- Service defined in ./frontend-service.yaml
+#
+#   curl -H "Host: docker-kubernetes-app.local" http://localhost/api/hello   # after the hosts-file step in the README
+#
+# ROUTING:
+# localhost:4300 — without Ingress
+#   Browser :4300 → WSL2/wslrelay :4300 → cloud-provider-kind :4300
+#     → Service "frontend-dev-localhost" (k8s/overlays/dev/frontend-localhost.yaml)
+#     port 4300 → targetPort 4200
+#     → frontend Pod directly, nginx:4200
+#
+# localhost:80 (as docker-kubernetes-app.local) — with Ingress
+#   Browser :80 → WSL2/wslrelay :80 → cloud-provider-kind :80
+#     → Service "ingress-nginx-controller" (installed separately, not part of this repo)
+#     → ingress-nginx pod reads the Ingress object rules (k8s/base/networking/ingress.yaml)
+#     "/api" → Service "backend" (port 8080)
+#     "/"    → Service "frontend" (port 80 → targetPort 4200)
+#     → same pods, same nginx:4200 / same backend:8080
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Single entry point: /api goes to the backend, everything else to the frontend"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"   # largest request body ingress-nginx accepts (its default, stated explicitly)
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"   # local dev is plain HTTP; do not redirect to HTTPS
+spec:
+  # Common fields missing: tls, defaultBackend
+  # specific Ingress controller type to handle this Ingress object (Traefik, an AWS ALB controller, etc.)
+  ingressClassName: nginx
+  rules:
+    - host: docker-kubernetes-app.local
+      http: &app-routes
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8080  # be-service-port
+              # Common fields missing: resource
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80  # fe-service-port
+    - http: *app-routes
+          # YAML alias means same PATHs as above

@@ -1,0 +1,27 @@
+# Purpose: keeps available during planned cluster maintenance -- caps how many backend pods a voluntary disruption
+# (node drain, cluster upgrade) can take down at once. Doesn't protect against involuntary disruptions (a node crashing outright).
+#   kubectl drain desktop-control-plane --ignore-daemonsets   # see this actually block/limit the eviction
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   backend-pdb -- not referenced by name anywhere else
+# REFERENCES:
+#   app.kubernetes.io/name: backend (pod label) -- defined in ../controllers/backend-deployment.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend-pdb
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Keeps at least one backend Pod up during voluntary disruptions (node drain, upgrade)"
+spec:
+  # Common fields missing: maxUnavailable
+  minAvailable: 1
+  # a Pod that is running but not Ready may still be evicted, so a stuck Pod can never block a node drain
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend

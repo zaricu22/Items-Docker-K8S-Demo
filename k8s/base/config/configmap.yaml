@@ -1,0 +1,20 @@
+# Purpose: non-secret (public) runtime configuration, kept separate from the image,
+# so the same image can run with different config per environment without a rebuild.
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   backend-config -- referenced by ../controllers/backend-deployment.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Non-secret runtime settings of items-api, injected as environment variables via envFrom"
+data:
+  APP_ENV: "demo"
+  LOG_LEVEL: "info"
+# Common fields missing: binaryData, immutable

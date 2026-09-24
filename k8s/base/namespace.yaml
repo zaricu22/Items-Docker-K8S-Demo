@@ -1,0 +1,22 @@
+# Purpose: isolates every object in this directory from anything else in the cluster
+# (Cluster / Node (VM) / Pod (scheduling unit) / Container (running process)).
+# Every other manifest here sets `namespace: docker-kubernetes-app` and assumes this object already exists -- apply this one first.
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   docker-kubernetes-app -- referenced by every other file in k8s/base/ (namespace: docker-kubernetes-app)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/part-of: docker-kubernetes-app
+    # Pod Security Admission: a Pod must satisfy the "baseline" profile to be created here; violations of the stricter
+    # "restricted" profile are only warned about and audited (every workload in this repo is written to satisfy it).
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+    #   kubectl run priv --image=busybox:1.36 --privileged -n docker-kubernetes-app -- sleep 3600   # expect this rejected by "baseline"
+  annotations:
+    kubernetes.io/description: "Everything of the docker-kubernetes-app demo: backend, frontend, database and their supporting objects"
+# Common fields missing: spec.finalizers

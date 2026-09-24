@@ -1,0 +1,9 @@
+# Purpose: overrides just the replica count the base sets (2),  a higher starting point for real traffic.
+# Still well inside policy/horizontal-pod-autoscaler.yaml's minReplicas: 2 / maxReplicas: 6 range.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-deployment
+  namespace: docker-kubernetes-app
+spec:
+  replicas: 3

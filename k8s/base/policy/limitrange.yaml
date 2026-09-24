@@ -1,0 +1,45 @@
+# Purpose: a namespace-wide safety net -- caps and default resource requests/limits for any container that doesn't set its own,
+# so one misconfigured pod can't request unbounded CPU/memory.
+# Every container in this project's manifests already sets its own, so this mainly documents the pattern rather than actually kicking in.
+#   kubectl run nolimit --image=busybox:1.36 -n docker-kubernetes-app -- sleep 3600 && kubectl get pod nolimit -n docker-kubernetes-app -o yaml   # see the defaults get injected
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   namespace-limits -- not referenced by name anywhere (LimitRange applies automatically, no selector)
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: namespace-limits
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Default, minimum and maximum resources per container, per Pod and per PersistentVolumeClaim"
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 200m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      min:
+        cpu: 10m
+        memory: 16Mi
+      max:
+        cpu: "1"
+        memory: 1Gi
+      # a container's limit may be at most this many times its request (every workload here stays well under it)
+      maxLimitRequestRatio:
+        cpu: "10"
+        memory: "4"
+    - type: Pod
+      max:
+        cpu: "2"
+        memory: 2Gi
+    - type: PersistentVolumeClaim
+      min:
+        storage: 100Mi
+      max:
+        storage: 5Gi

@@ -1,0 +1,35 @@
+# Purpose: lists every manifest that makes up this "base" as one Kustomize
+# unit, now that they're split across controllers/networking/config/policy
+# subdirectories -- without this, a plain `kubectl apply -f k8s/base/`
+# would only pick up namespace.yaml (it doesn't recurse into
+# subdirectories by default) and silently skip everything else.
+#
+#   kubectl apply -k k8s/base/          # apply the whole base as one unit
+#   kubectl kustomize k8s/base/         # render the merged YAML locally, no cluster needed
+#
+# This is also the file an overlay (k8s/overlays/dev/, .../prod/, ...)
+# would list as its `resources: [../../base]` to patch on top of --
+# splitting into packages here doesn't change that at all.
+
+resources:
+  - namespace.yaml
+  - controllers/backend-deployment.yaml
+  - controllers/frontend-deployment.yaml
+  - controllers/database-statefulset.yaml
+  - controllers/worker-daemonset.yaml
+  - controllers/migration-job.yaml
+  - controllers/cleanup-cronjob.yaml
+  - networking/ingress.yaml
+  - networking/backend-service.yaml
+  - networking/frontend-service.yaml
+  - networking/database-service.yaml
+  - networking/networkpolicy.yaml
+  - config/configmap.yaml
+  - config/secret.yaml
+  - config/database-secret.yaml
+  - config/serviceaccount.yaml
+  - config/role-based-access-control.yaml
+  - policy/resourcequota.yaml
+  - policy/limitrange.yaml
+  - policy/horizontal-pod-autoscaler.yaml
+  - policy/pod-disruption-budget.yaml

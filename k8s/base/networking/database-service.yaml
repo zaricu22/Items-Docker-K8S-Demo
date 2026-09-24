@@ -1,0 +1,37 @@
+# Purpose: gives the database StatefulSet's pod(s) a stable, individually
+# addressable DNS name -- headless (`clusterIP: None`), so lookups return
+# each pod's own IP directly instead of load-balancing across them, which
+# is what a StatefulSet's stable-identity guarantee actually depends on.
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   database -- referenced by ../controllers/database-statefulset.yaml (serviceName)
+# REFERENCES:
+#   app.kubernetes.io/name: database (pod label) -- defined in ../controllers/database-statefulset.yaml
+#   db-deploy-port -- defined in ../controllers/database-statefulset.yaml (containers[].ports)
+apiVersion: v1
+kind: Service
+metadata:
+  name: database
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: database
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Headless Service: stable per-pod DNS name for the Postgres StatefulSet"
+spec:
+  type: ClusterIP   # a headless Service is a ClusterIP Service with clusterIP: None
+  clusterIP: None   # headless -- gives each StatefulSet pod its own stable DNS name
+  #   kubectl run -it --rm dnsutils --image=busybox:1.36 -n docker-kubernetes-app -- nslookup database   # see each pod's own A record
+  sessionAffinity: None
+  ipFamilyPolicy: SingleStack
+  ipFamilies: ["IPv4"]
+  # Common fields missing: externalName, externalTrafficPolicy, publishNotReadyAddresses
+  selector:
+    app.kubernetes.io/name: database
+  ports:
+    - name: db-service-port
+      protocol: TCP
+      port: 5432
+      targetPort: db-deploy-port

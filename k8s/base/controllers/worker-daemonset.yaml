@@ -1,0 +1,101 @@
+# Usual use-cases (DaemonSet): node-level agents that must run on every node;
+# log shippers (Fluent Bit), node metrics collectors (node-exporter), network/storage plugins, security agents.
+#
+# Purpose: runs the node-level agent (e.g. a log-shipper or node-metrics collector) that needs to exist on every node,
+# not a fixed number of nodes.
+# A DaemonSet does that: one pod per matching node, not a replica count.
+# Unlike a Deployment, there's no `replicas` field; the controller schedules exactly one copy per node
+# that tolerates its taints (or every node, if none are specified).
+#
+# Kubernetes identifier = namespace+kind+name; but we intentionally make every 'name' unique to show referencing origins more obvious.
+# DEFINES:
+#   worker -- not referenced by name anywhere else (no HorizontalPodAutoscaler targets it)
+#   app.kubernetes.io/name: worker (pod label) -- not selected by anything else either (no Service exists for worker)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: worker
+  namespace: docker-kubernetes-app
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/component: node-agent
+    app.kubernetes.io/part-of: docker-kubernetes-app
+  annotations:
+    kubernetes.io/description: "Tiny node-metrics agent: one Pod per node that logs the node's load average and available memory"
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1   # update one node's agent at a time
+  minReadySeconds: 5      # a new Pod must stay Ready this long before it counts as available
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+  # ===== POD ===== everything from `template:` down to the end of this file IS the Pod;
+  # the DaemonSet above it says "run exactly one copy of this Pod per matching node," with no replica count at all.
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: worker
+        app.kubernetes.io/component: node-agent
+        app.kubernetes.io/part-of: docker-kubernetes-app
+    spec:
+      serviceAccountName: default
+      automountServiceAccountToken: false   # the agent never calls the Kubernetes API, so it gets no token
+      terminationGracePeriodSeconds: 10     # the loop below stops on SIGTERM right away
+      dnsPolicy: ClusterFirst
+      hostNetwork: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      # Common fields missing: initContainers, affinity, volumes, imagePullSecrets, priorityClassName
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534   # `nobody` -- numeric, since kubelet can't verify a named user for runAsNonRoot
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+      # ---- CONTAINERS ---- the container(s) that actually keep running for the Pod's lifetime;
+      # a tiny node-metrics agent: every 30s it logs this node's load average and available memory
+      # (read from /proc, which reflects the node) -- see it with `kubectl logs -n docker-kubernetes-app daemonset/worker`.
+      containers:
+        - name: worker
+          # The smallest Unix tools image (~2 MB, smaller than Alpine), bundling sh, nc, sleep, echo, etc.
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          # Common fields missing: args
+          # `trap` makes the loop exit on SIGTERM immediately (a plain shell as PID 1 would ignore it and be killed after
+          # the grace period); `sleep & wait` lets the trap run while sleeping.
+          command:
+            - sh
+            - -c
+            - |
+              trap 'exit 0' TERM
+              while true; do
+                echo "node=$NODE_NAME load=$(cut -d' ' -f1-3 /proc/loadavg) mem_available_kb=$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
+                sleep 30 & wait $!
+              done
+          # Common fields missing: envFrom, ports, startupProbe, readinessProbe, livenessProbe, lifecycle, volumeMounts, workingDir
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534   # `nobody` -- numeric, since kubelet can't verify a named user for runAsNonRoot
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

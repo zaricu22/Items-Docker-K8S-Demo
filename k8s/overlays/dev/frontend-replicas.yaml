@@ -1,0 +1,8 @@
+# Purpose: same reasoning as backend-replicas.yaml, for the frontend Deployment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-deployment
+  namespace: docker-kubernetes-app
+spec:
+  replicas: 1

@@ -1,0 +1,22 @@
+# The build stage runs `COPY . .`, so anything not ignored here lands in the build.
+# Dependencies and build output: the image installs and builds its own (host copies would be stale or the wrong platform).
+node_modules/
+dist/
+.angular/
+coverage/
+*.log
+
+# Env files never belong in an image.
+.env
+.env.*
+
+# VCS, IDE and OS files.
+.git/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Not needed in the context (BuildKit still reads the Dockerfile itself).
+# nginx.conf is deliberately NOT ignored: the runtime stage COPYs it.
+Dockerfile

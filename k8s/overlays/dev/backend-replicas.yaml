@@ -1,0 +1,9 @@
+# Purpose: overrides just the replica count the base sets (2),
+# dev runs a single replica since there's no traffic to load-balance
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-deployment
+  namespace: docker-kubernetes-app
+spec:
+  replicas: 1
