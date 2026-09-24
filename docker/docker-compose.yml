@@ -72,9 +72,15 @@ services:
       NGINX_ENTRYPOINT_QUIET_LOGS: "1"   # silences nginx's startup notices about its read-only config dir
     ports:
       - "127.0.0.1:8080:4200"   # host_ip:host:container -- loopback only, so the dev port isn't reachable from the LAN; EXPOSE only documents 4200, this line publishes it
-    tmpfs:
-      - /var/cache/nginx        # nginx still needs a writable cache dir and pid file: in-memory, wiped on restart (like the k8s emptyDirs).
-      - /var/run
+    volumes:
+      - type: tmpfs
+        target: /var/cache/nginx
+        tmpfs:
+          mode: 0o1777   # world-writable + sticky (like /tmp) -- Compose's tmpfs doesn't support uid/gid, so ownership can't match the non-root `nginx` user; a permissive mode is the only fix
+      - type: tmpfs
+        target: /var/run
+        tmpfs:
+          mode: 0o1777
     deploy:
       resources:
         limits:   # hard cgroup ceiling (like k8s `limits:`); exceeding memory means OOM-kill
@@ -145,9 +151,7 @@ services:
     restart: unless-stopped   # a continuous long-running container
     logging: *default-logging
 
-  # Real, minimal Go binary (stdlib only): logs container's load average and available memory on an WORKER_INTERVAL, reading /proc dir directly;
-  # no DB, no network, no profile, no dependencies, no other service to wait on, so it starts independently of everything else here.
-  # Demonstrate a one-shot container which execute worker's Dockerfile example with own illustrated concepts.
+  # Real Go binary (stdlib only, logs container's load/memory from /proc)
   worker:
     <<: *hardened
     labels:
