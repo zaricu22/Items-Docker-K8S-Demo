@@ -1,5 +1,29 @@
 # Docker & Kubernetes Concepts
 
+<!-- contents -->
+**Contents**
+
+- [Purpose](#purpose)
+- [Architecture](#architecture)
+- [Theoretical Background](#theoretical-background)
+  - [Docker -- container technology](#docker----container-technology)
+  - [Kubernetes -- coordinator (manager)](#kubernetes----coordinator-manager)
+  - [Docker Compose vs Kubernetes](#docker-compose-vs-kubernetes)
+  - [Difference: time-schedule vs node-placement scheduling (Kubernetes)](#difference-time-schedule-vs-node-placement-scheduling-kubernetes)
+  - [Orchestration vs. Choreography (Kubernetes)](#orchestration-vs-choreography-kubernetes)
+- [Layout](#layout)
+- [k8s files purpose](#k8s-files-purpose)
+- [Kubernetes Installation - Local Docker Desktop's](#kubernetes-installation---local-docker-desktops)
+  - [Installation commands, run in order](#installation-commands-run-in-order)
+- [Docker-only: build and run backend + frontend](#docker-only-build-and-run-backend--frontend)
+  - [Without Compose](#without-compose)
+  - [With Compose](#with-compose)
+- [Docker concepts](#docker-concepts)
+- [Kubernetes concepts](#kubernetes-concepts)
+- [Troubleshooting](#troubleshooting)
+- [Further reading](#further-reading)
+<!-- /contents -->
+
 ## Purpose
 
 A reference repo: every Dockerfile, Compose file and Kubernetes manifest
@@ -14,8 +38,8 @@ Spring Boot service, one endpoint: `GET /api/hello`) and **items-frontend**
 (`frontend/` — a minimal Angular page: a button that calls it). Both live
 at the repo root, one level up from the Docker examples in `docker/` --
 they're real application projects, not just a Dockerfile demonstrating
-concepts. Click the button, get "Hello from Backend" back — see "Running
-things locally" below for the exact tested steps, both via `docker compose`
+concepts. Click the button, get "Hello from Backend" back — see "Kubernetes
+Installation" and "Docker-only" below for the exact tested steps, both via `docker compose`
 and via a real kind/minikube cluster.
 
 `docker/worker` is real too: a small Go binary (stdlib only) that logs the
@@ -35,6 +59,82 @@ creates a real `items` table in the real Postgres, the `nightly-cleanup`
 CronJob deletes rows older than 30 days from it, and the `worker`
 DaemonSet is a tiny per-node agent that logs the node's load and free
 memory.
+
+## Architecture
+
+The same two images run two ways: on **Kubernetes** (`k8s/`) and with
+**Docker Compose** (`docker/docker-compose.yml`). The browser only ever
+talks to the frontend's nginx or to the Ingress; nginx proxies `/api/` to
+the backend, so no CORS is needed anywhere.
+
+**Kubernetes** (Docker Desktop, namespace `docker-kubernetes-app`):
+
+```mermaid
+flowchart LR
+    browser["Browser"]
+    subgraph ingns ["namespace ingress-nginx (installed separately)"]
+        ingctl["ingress-nginx controller<br/>applies Ingress app-ingress"]
+    end
+    subgraph ns ["namespace docker-kubernetes-app"]
+        felb["Service frontend-dev-localhost<br/>LoadBalancer 4300 → 4200"]
+        fesvc["Service frontend<br/>ClusterIP 80 → 4200"] --> fe["Deployment frontend-deployment<br/>nginx :4200, ×2"]
+        besvc["Service backend<br/>ClusterIP 8080"] --> be["Deployment backend-deployment<br/>Spring Boot :8080, ×2 (HPA 2–6)<br/>NetworkPolicy: in from frontend + ingress-nginx,<br/>out to database + DNS only"]
+        dbsvc["Service database<br/>headless"] --> db[("StatefulSet database-statefulset<br/>Postgres 16, 1 Gi PVC")]
+        job["Job db-migration<br/>creates the items table"] --> dbsvc
+        cron["CronJob nightly-cleanup<br/>02:00 UTC"] --> dbsvc
+        ds["DaemonSet worker<br/>one pod per node"]
+    end
+    browser -- "docker-kubernetes-app.local :80" --> ingctl
+    browser -. ":4300, dev overlay only" .-> felb
+    ingctl -- "/" --> fesvc
+    ingctl -- "/api" --> besvc
+    felb --> fe
+    fe -- "nginx proxy /api/" --> besvc
+    be -. "initContainer waits for :5432<br/>(never queries it)" .-> dbsvc
+```
+
+Two routes reach the same frontend pods:
+- `:80`, through the Ingress. This is the production-shaped route: one hostname, with `/api` and `/` routed by path.
+- `:4300`, a dev-only shortcut that skips the Ingress.
+
+The hop-by-hop version of both routes, through WSL2 and `cloud-provider-kind`, is in
+[Network and Routing](#network-and-routing). The backend's NetworkPolicy
+only lets in traffic from the frontend pods and the `ingress-nginx`
+namespace, and only lets out traffic to Postgres and DNS.
+
+The replica counts are the base values: the dev overlay runs 1 of each,
+prod runs 3. Unlike Compose, nothing makes the backend wait for the
+`db-migration` Job: its initContainer only waits until Postgres accepts
+connections, and the two start in parallel.
+
+**Docker Compose** (single host, two networks):
+
+```mermaid
+flowchart LR
+    browser["Browser"] -- "127.0.0.1:8080" --> fe["frontend<br/>nginx :4200"]
+    fe -- "app-net<br/>/api/ proxy" --> be["backend<br/>Spring Boot :8080"]
+    fe -. "waits for: healthy,<br/>restarts with it" .-> be
+    be -. "waits for: healthy<br/>(db-net, never queries it)" .-> db[("database<br/>Postgres 16, volume db-data")]
+    be -. "waits for: completed" .-> mig["db-migration<br/>one-shot psql"]
+    mig -- "db-net" --> db
+    bak["db-backup<br/>--profile tools"] -- "db-net" --> db
+    worker["worker<br/>network_mode: none"]
+```
+
+`db-net` is `internal: true`: the frontend isn't on it, and nothing on it
+can reach the internet. Solid arrows are traffic; dashed arrows are
+`depends_on` start order, pointing from the service that waits to the one
+it waits for.
+
+| Component | Built from | Docker Compose | Kubernetes | Reached at |
+|---|---|---|---|---|
+| **frontend** | `frontend/` (Angular, served by nginx) | service `frontend`, `127.0.0.1:8080 → 4200` | Deployment + Service `frontend` (80 → 4200); dev Service on 4300 | <http://localhost:8080> (Compose), <http://localhost:4300> (k8s dev), <http://docker-kubernetes-app.local> (Ingress) |
+| **backend** | `backend/` (Spring Boot, `GET /api/hello`) | service `backend`, `expose: 8080` | Deployment + Service `backend` (8080), HPA 2–6 | only through the frontend's `/api/` proxy or the Ingress `/api` rule |
+| **database** | `postgres:16-alpine` | service `database` on `db-net`, volume `db-data` | StatefulSet + headless Service, 1 Gi PVC | in-cluster / `db-net` only |
+| **migration** | `postgres:16-alpine` + `psql` | one-shot service `db-migration` | Job `db-migration` | runs once, then exits |
+| **cleanup** | `postgres:16-alpine` + `psql` | — | CronJob `nightly-cleanup` (deletes rows older than 30 days) | runs on schedule |
+| **backup** | `postgres:16-alpine` + `pg_dump` | service `db-backup`, opt-in via `--profile tools` | — | on demand |
+| **worker** | `docker/worker/` (Go) in Compose, `busybox` in k8s | service `worker`, no network | DaemonSet `worker` | logs only |
 
 ## Theoretical Background
 
@@ -256,7 +356,7 @@ Browser: http://localhost:4300
                                the app gets served.
 
 Routing with Ingress setup:
-The real Ingress route (docker-kubernetes-app.local, step 3 of "Local Preparation" below) inserts one more hop at steps 3-4 instead: host port 80/443 -> ingress-nginx-controller's own LoadBalancer Service and pod -> the Ingress object's routing rules -> the base frontend Service (ClusterIP, port 80, k8s/base/networking/frontend-service.yaml) -> the same pod, same nginx, same port 4200 from there on. Only one thing ever changes between the two routes: which Service you enter through.
+The real Ingress route (docker-kubernetes-app.local, step 3 of "Kubernetes Installation" below) inserts one more hop at steps 3-4 instead: host port 80/443 -> ingress-nginx-controller's own LoadBalancer Service and pod -> the Ingress object's routing rules -> the base frontend Service (ClusterIP, port 80, k8s/base/networking/frontend-service.yaml) -> the same pod, same nginx, same port 4200 from there on. Only one thing ever changes between the two routes: which Service you enter through.
 
         (same as steps 1-3 above, but on host port 80/443 instead of 4300)
         |
@@ -287,7 +387,7 @@ PersistentVolume (PV)       -- the actual disk that fulfills a PVC, either:
 StorageClass                -- names which CSI driver/provisioner to use when dynamically creating a PV.
 
 For stateful Pods specifically (StatefulSet's volumeClaimTemplates):
-  - Each replica gets its OWN PVC (data-database-0, data-database-1, ...), never one shared PVC.
+  - Each replica gets its OWN PVC (data-database-statefulset-0, data-database-statefulset-1, ...), never one shared PVC.
   - A Pod always rebinds to that SAME PVC, even after being rescheduled to a different node.
   - That 1:1, stable Pod<->PVC link is exactly what "stable identity" buys over a Deployment,
     where Pods are interchangeable and share no such storage relationship at all.
@@ -455,7 +555,7 @@ of these same base files.
 | **Controllers** | | It defines Pods (the scheduling unit) and their Containers (the actual running processes). |
 | `controllers/backend-deployment.yaml` | Deployment | Runs self-healing copies of items-api (Spring Boot). Includes health checks, resource limits, and a locked-down (non-root) security context. The `replicas: 2` runs all pods at once, continuously enforced by self-healing; to change that count, edit this file manually or define it dynamically with `HorizontalPodAutoscaler` instead. |
 | `controllers/frontend-deployment.yaml` | Deployment | Same self-healing guarantee, for items-frontend (the Angular page + button), served as static files through nginx instead of a JVM. |
-| `controllers/database-statefulset.yaml` | StatefulSet | Runs Postgres. Not a Deployment on purpose: a Deployment treats replicas as interchangeable, but a database pod's disk isn't interchangeable — losing it means losing data. A StatefulSet gives the pod a fixed name (`database-0`) and its own disk that follows it across restarts. |
+| `controllers/database-statefulset.yaml` | StatefulSet | Runs Postgres. Not a Deployment on purpose: a Deployment treats replicas as interchangeable, but a database pod's disk isn't interchangeable — losing it means losing data. A StatefulSet gives the pod a fixed name (`database-statefulset-0`) and its own disk that follows it across restarts. |
 | `controllers/worker-daemonset.yaml` | DaemonSet | A tiny node-metrics agent (logs the node's load and free memory every 30s) that runs on *every* node, not a fixed count. Add a node, get one more copy automatically — no other controller type does that. |
 | `controllers/migration-job.yaml` | Job | A one-time task that runs to completion and stops — here it creates the `items` table with `psql` (idempotent). Unlike a Deployment, it isn't restarted afterward, because it's not meant to run forever. |
 | `controllers/cleanup-cronjob.yaml` | CronJob | The same idea as a Job, but on a repeating schedule (`0 2 * * *`, pinned to UTC with `timeZone`) — here it deletes `items` rows older than 30 days. A thin wrapper that creates a new Job automatically, the same way OS-level cron would. |
@@ -480,22 +580,24 @@ of these same base files.
 
 ### Installation commands, run in order
 
-**Note:** this project uses only one cluster, `docker-desktop`, and that
-cluster has only one Node, `desktop-control-plane` -- both are Docker
-Desktop's own default names, assigned automatically by step 1, not
-something this project configures. This project only defines the
-namespace `docker-kubernetes-app` (`k8s/base/namespace.yaml`) on top of
-that -- everything else (cluster, node, `ingress-nginx` and `kube-system`
-namespaces) is shared, pre-existing infrastructure.
+> [!NOTE]
+> This project uses only one cluster, `docker-desktop`, and that
+> cluster has only one Node, `desktop-control-plane` -- both are Docker
+> Desktop's own default names, assigned automatically by step 1, not
+> something this project configures. This project only defines the
+> namespace `docker-kubernetes-app` (`k8s/base/namespace.yaml`) on top of
+> that -- everything else (cluster, node, `ingress-nginx` and `kube-system`
+> namespaces) is shared, pre-existing infrastructure.
 
-**Note:** `kubectl apply -k k8s/overlays/dev/` from step 6 is the single
-command that actually creates every Kubernetes component this project
-defines -- Ingress, Deployments, StatefulSet, DaemonSet, Job, CronJob,
-Services, ConfigMap, Secret, ServiceAccount/RBAC, ResourceQuota/LimitRange,
-HorizontalPodAutoscaler, PodDisruptionBudget, NetworkPolicy -- all of it, in one shot, because
-`k8s/base/kustomization.yaml` lists every file explicitly (see "k8s files
-purpose" below for what each one does). None of them are applied
-individually or in a separate step.
+> [!IMPORTANT]
+> `kubectl apply -k k8s/overlays/dev/` from step 6 is the single
+> command that actually creates every Kubernetes component this project
+> defines -- Ingress, Deployments, StatefulSet, DaemonSet, Job, CronJob,
+> Services, ConfigMap, Secret, ServiceAccount/RBAC, ResourceQuota/LimitRange,
+> HorizontalPodAutoscaler, PodDisruptionBudget, NetworkPolicy -- all of it, in one shot, because
+> `k8s/base/kustomization.yaml` lists every file explicitly (see "k8s files
+> purpose" below for what each one does). None of them are applied
+> individually or in a separate step.
 
 This is the exact sequence that took this project from an already-empty
 Docker Desktop Kubernetes cluster to the fully deployed, browser-reachable
@@ -576,6 +678,11 @@ it as a brand-new `LoadBalancer` request, which re-triggers
 `cloud-provider-kind`'s entire "assign an IP and publish the port"
 sequence fresh.
 
+> [!WARNING]
+> Deleting `ingress-nginx-controller` takes the `:80` route down until the controller is re-applied and gets its
+> address again. Editing the `hosts` file changes name resolution for the whole machine and needs administrator rights
+> (an editor started as Administrator on Windows, `sudo` on Linux/Mac). Remove the line again when you're done.
+
 ```sh
 # reassign IP and ports for the Ingress controller
 kubectl delete svc ingress-nginx-controller -n ingress-nginx
@@ -624,10 +731,12 @@ no steps skipped or reordered, matching the request-path diagram above.
 No Kubernetes, no Compose -- just the two real images, built and run
 directly with plain `docker build`/`docker run`, connected over a
 hand-made network so frontend's nginx can still resolve `backend` by
-name.  
-This hello-world backend never actually queries Postgres in the first place --
-so skipping the database here isn't cutting a corner, it's just skipping a
-dependency this app doesn't really have:
+name.
+
+> [!NOTE]
+> This hello-world backend never actually queries Postgres in the first place --
+> so skipping the database here isn't cutting a corner, it's just skipping a
+> dependency this app doesn't really have:
 
 ```sh
 docker build -t docker-kubernetes-app/backend:latest backend/
@@ -683,6 +792,10 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up 
 ```sh
 docker compose -f docker/docker-compose.yml --profile tools run --rm db-backup > backup.sql
 ```
+
+> [!WARNING]
+> `docker compose -f docker/docker-compose.yml down` stops the stack and keeps its data.
+> `down -v` also **deletes the `db-data` and `backend-data` volumes**, so the database starts empty next time.
 
 ## Docker concepts
 
@@ -801,3 +914,49 @@ docker compose -f docker/docker-compose.yml --profile tools run --rm db-backup >
 | Lease | ❌ | leader election and node heartbeats (e.g. the `ingress-nginx` leader lease) |
 | LocalSubjectAccessReview | ❌ | a one-off "may this user do X in this namespace?" check |
 | ResourceClaim / ResourceClaimTemplate | ❌ | a request for special hardware such as GPUs, and a template that creates one per Pod |
+
+## Troubleshooting
+
+All `kubectl` commands below assume `-n docker-kubernetes-app`.
+
+**Kubernetes**
+
+| Symptom | Fix |
+|---|---|
+| `kubectl` fails with `connection refused` or talks to the wrong cluster | `kubectl config use-context docker-desktop`, and check that Docker Desktop shows "Kubernetes is running", not "starting". |
+| Pods show `ErrImagePull` / `ImagePullBackOff` for `docker-kubernetes-app/*` | The images only exist locally. Build them and tag them for the overlay you applied (`:dev` or `:prod`): steps 4–5 of the installation. |
+| A rebuilt image doesn't show up in the running pods | `kubectl apply` doesn't restart pods when the manifest hasn't changed. Re-tag, then `kubectl rollout restart deployment/backend-deployment` (or `frontend-deployment`). |
+| Backend pod stuck at `Init:0/1` | Its initContainer is waiting for `database:5432`. Check `kubectl get pods` for `database-statefulset-0`, and `kubectl get pvc` for a claim stuck in `Pending`. |
+| Pods stay `Pending` | `kubectl describe pod <name>` shows why: usually `exceeded quota` (the ResourceQuota) or `Insufficient cpu/memory` on the single node. Lower the replica counts or raise the quota. |
+| `db-migration` is missing from `kubectl get pods` | `ttlSecondsAfterFinished: 300` deletes the finished Job after 5 minutes. To run it again: `kubectl delete job db-migration`, then re-apply. The SQL is idempotent. |
+| `http://docker-kubernetes-app.local` doesn't resolve | Add `127.0.0.1 docker-kubernetes-app.local` to the hosts file (`C:\Windows\System32\drivers\etc\hosts` or `/etc/hosts`). |
+| `:4300` works but the Ingress route doesn't (or the other way round) | They are two independent `LoadBalancer` Services. If `kubectl get svc -n ingress-nginx` shows `EXTERNAL-IP <pending>`, or the Ingress was applied after the controller, republish the controller: step 7. |
+| `/api` through the Ingress times out | The NetworkPolicy only admits the frontend pods and a namespace named exactly `ingress-nginx`. A controller installed in another namespace is blocked. |
+| The NetworkPolicy seems to have no effect | Policies only work if the network plugin enforces them. Test with the `kubectl exec ... wget database:5432` command in `networkpolicy.yaml`. |
+| HPA shows `TARGETS <unknown>` and never scales | Docker Desktop has no metrics-server. Install it (on Docker Desktop it usually needs the `--kubelet-insecure-tls` arg), then `kubectl get hpa -w`. |
+| Pod creation rejected with `violates PodSecurity "baseline"` | The namespace enforces the `baseline` level. `restricted` is only `warn`/`audit`, so those warnings don't block anything. |
+| `kubectl apply -k` fails with `field is immutable` | Some fields can't be changed in place (a Job's pod template, a StatefulSet's `volumeClaimTemplates`). Delete that object and apply again. |
+
+**Docker / Compose**
+
+| Symptom | Fix |
+|---|---|
+| Frontend container exits right away with `mkdir() ... Permission denied` | nginx runs as non-root on a read-only filesystem and needs writable `/var/cache/nginx` and `/var/run`. Add the `--tmpfs ...:mode=1777` flags (see [Without Compose](#without-compose)); Compose already sets them. |
+| `up backend frontend` also starts `database` and `db-migration` | Expected: Compose always starts the `depends_on` chain. Remove `backend`'s `depends_on` to stop it. |
+| `502 Bad Gateway` on `/api` after the backend restarts | nginx resolves `backend` once at startup and keeps the old IP. Compose restarts the frontend for you (`depends_on.restart: true`); with plain `docker run`, restart the frontend container. |
+| Port `8080` already in use | Another process holds it. Change the host side of `ports:` (`127.0.0.1:8081:4200`) or stop that process. |
+| `db-backup` doesn't run with `up` | It's behind a profile: `docker compose -f docker/docker-compose.yml --profile tools run --rm db-backup > backup.sql`. |
+| Need a clean database | `docker compose -f docker/docker-compose.yml down -v` removes the `db-data` and `backend-data` volumes. |
+
+---
+
+## Further reading
+
+- Docker: [Dockerfile reference](https://docs.docker.com/reference/dockerfile/) · [Multi-stage builds](https://docs.docker.com/build/building/multi-stage/) · [Build cache](https://docs.docker.com/build/cache/) · [Build secrets](https://docs.docker.com/build/building/secrets/) · [Multi-platform builds](https://docs.docker.com/build/building/multi-platform/)
+- Compose: [Compose file reference](https://docs.docker.com/reference/compose-file/) · [Startup order](https://docs.docker.com/compose/how-tos/startup-order/) · [Profiles](https://docs.docker.com/compose/how-tos/profiles/) · [Compose Watch](https://docs.docker.com/compose/how-tos/file-watch/) · [Secrets in Compose](https://docs.docker.com/compose/how-tos/use-secrets/)
+- Kubernetes workloads: [Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/) · [StatefulSets](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/) · [DaemonSet](https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/) · [Jobs](https://kubernetes.io/docs/concepts/workloads/controllers/job/) · [CronJob](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/) · [Probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/)
+- Kubernetes networking: [Service](https://kubernetes.io/docs/concepts/services-networking/service/) · [Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/) · [Network Policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/) · [DNS for Services and Pods](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/) · [ingress-nginx](https://kubernetes.github.io/ingress-nginx/)
+- Configuration and security: [ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/) · [Secrets](https://kubernetes.io/docs/concepts/configuration/secret/) · [RBAC](https://kubernetes.io/docs/reference/access-authn-authz/rbac/) · [Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/) · [Security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/)
+- Resources and scaling: [Requests and limits](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/) · [ResourceQuota](https://kubernetes.io/docs/concepts/policy/resource-quotas/) · [LimitRange](https://kubernetes.io/docs/concepts/policy/limit-range/) · [HorizontalPodAutoscaler](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/) · [Disruptions and PDBs](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/) · [metrics-server](https://github.com/kubernetes-sigs/metrics-server)
+- Storage: [Persistent Volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) · [Storage Classes](https://kubernetes.io/docs/concepts/storage/storage-classes/)
+- Tooling: [Kustomize](https://kubectl.docs.kubernetes.io/references/kustomize/) · [kubectl quick reference](https://kubernetes.io/docs/reference/kubectl/quick-reference/) · [Docker Desktop Kubernetes](https://docs.docker.com/desktop/features/kubernetes/) · [Debugging running pods](https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/)
